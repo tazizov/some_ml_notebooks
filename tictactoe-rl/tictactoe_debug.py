@@ -17,8 +17,11 @@ class TicTacToeGame:
         while not is_done:
             step_x = player_x.strategy(state)
             state, reward_x, is_done, _ = self.env.step(step_x)
+            if is_done:
+                break
             step_o = player_o.strategy(state)
             self.env.printBoard()
+            
             state, reward_o, is_done, _ = self.env.step(step_o)
             rewards_x.append(reward_x)
             rewards_o.append(reward_o)
@@ -26,7 +29,7 @@ class TicTacToeGame:
             print(reward_x, reward_o)
         return rewards_x, rewards_o
 
-if __name__ == '__main__':    
+if __name__ == '__main__':  
     env = TicTacToe()
     game = TicTacToeGame(env)
 
@@ -34,3 +37,4 @@ if __name__ == '__main__':
     player_o = RandomPlayer()
 
     game.run_episode(player_x, player_o)
+    print('yay')
