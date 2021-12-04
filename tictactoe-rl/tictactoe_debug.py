@@ -1,6 +1,6 @@
 from tictactoe_env import TicTacToe
 import numpy as np
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 from collections import defaultdict
 from itertools import product
 
@@ -76,11 +76,17 @@ class QLearningPlayer:
         #     # here we need reward[t + 1], s[t + 1]
         #     self.q[state][action] += self.alpha * (reward + self.gamma * np.max(self.q[state_next][action])) - self.q[state][action]
         self.total_episodes_training += 1
+        for episode_step in episode_history:
+            state, _, _ = episode_step
+            state_hash = state[0]
+            impossible_actions = np.where(np.array([*state_hash]) != '1')
+            self.q_table[state_hash][impossible_actions] = -np.inf
         for t in range(1, len(episode_history)):
             # to r[t - 1], s[t - 1]
             state_cur, action_cur, _ = episode_history[t - 1]
             state_next, _, reward_next = episode_history[t]
             state_cur_hash, state_next_hash = state_cur[0], state_next[0]
+            
             action_id = self.possible_actions.index(action_cur)
             # here we need reward[t + 1], s[t + 1]
             self.q_table[state_cur_hash][action_id] += self.alpha * (reward_next +\
@@ -100,7 +106,7 @@ class QLearningPlayer:
         else:
             action = greedy_action
         return action
-    
+
     def greedy_step(self, state_hash):
         return self.possible_actions[self.q_table[state_hash].argmax()]
     
@@ -112,5 +118,9 @@ if __name__ == "__main__":
     game = TicTacToeGame(env)
     qplayer_params = {'eps': 0.1, 'alpha': 0.01, 'gamma': 1}
     qplayer_x , qplayer_o = QLearningPlayer(**qplayer_params), QLearningPlayer(**qplayer_params)
+    for i in tqdm(range(100000)):
+        history_x, history_o = game.run_episode(qplayer_x, qplayer_o, True)
+        qplayer_x.update_q(history_x)
+        qplayer_o.update_q(history_o)
     history_x, history_o = game.run_episode(qplayer_x, qplayer_o, True)
     qplayer_x.update_q(history_x)
