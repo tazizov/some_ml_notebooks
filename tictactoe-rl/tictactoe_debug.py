@@ -1,6 +1,7 @@
 import re
 from tictactoe_env import TicTacToe
 import numpy as np
+import torch
 from tqdm.notebook import tqdm
 from collections import defaultdict
 from itertools import product
@@ -8,6 +9,7 @@ from abc import ABC, abstractmethod
 import matplotlib.pyplot as plt
 import seaborn as sns
 from IPython.display import clear_output
+import random
 
 class BasePlayer(ABC):
     def set_training(self):
@@ -110,12 +112,6 @@ class QLearningPlayer:
         self.set_training()
         self.total_episodes_training = 0
     
-    def set_training(self):
-        self.training = True
-
-    def set_evaluating(self):
-        self.training = False
-    
     def reset(self):
         self.q_table = defaultdict(lambda: np.zeros(self.size[0] * self.size[1]))
         self.total_episodes_training = 0
@@ -162,6 +158,75 @@ class QLearningPlayer:
     def __str__(self):
         return f"QLearningPlayer(eps={self.eps}, alpha={self.alpha}, gamma={self.gamma})"
 
+class DQNPlayer(BasePlayer):
+    def __init__(self, eps, alpha, gamma, n_rows, n_cols, model=None) -> None:
+        self.eps = eps
+        self.alpha = alpha
+        self.gamma = gamma
+        self.size = (n_rows, n_cols)
+        if model is not None:
+            self.model = model
+        else:
+            self.model = DQNet(hidden_size=128, board_size=self.size)
+        self.all_actions = list(product(range(n_rows), range(n_cols)))
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=alpha)
+        self.training = True
+        
+    def strategy(self, state):
+        state_hash = state[0]
+        coin = np.random.rand()
+        greedy_action = self.greedy_step(state_hash)
+        random_action = self.random_step(state_hash)
+        if self.training:
+            coin = np.random.rand() < self.eps
+            if coin:
+                action = random_action
+            else:
+                action = greedy_action
+        else:
+            action = greedy_action
+        return action
+    
+    def greedy_step(self, state_hash):
+        return self.all_actions[self.model(self._state_to_tensor(state_hash)).argmax().item()]
+    
+    def random_step(self, state_hash):
+        return self.all_actions[np.random.randint(0, len(self.all_actions) - 1)]
+
+    def update_q(self, experience):
+        states, actions, rewards, states_next = experience
+        states = torch.cat([self._state_to_tensor(state) for state in states])
+        states_next = torch.cat([self._state_to_tensor(state) for state in states_next])
+        actions = torch.tensor(actions, dtype=torch.int64).unsqueeze(1)
+        rewards = torch.tensor(rewards, dtype=torch.float64)
+        q = self.model(states).gather(1, actions)
+        qmax = self.model(states_next).detach().max(1)[0]
+        qnext = rewards + (self.gamma * qmax)
+        loss = torch.nn.functional.mse_loss(q.flatten().float(), qnext.flatten().float())
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
+        
+    def _state_to_tensor(self, state_hash):
+        return torch.tensor(np.array(list(state_hash), dtype=np.float64)).reshape(1, 1, self.size[0], self.size[1]).float()
+    
+    def reset(self):
+        pass
+    
+class DQNet(torch.nn.Module):
+    def __init__(self, hidden_size, board_size) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.board_size = board_size
+        self.conv = torch.nn.Conv2d(in_channels=1, out_channels=hidden_size, kernel_size=board_size)
+        self.l1 = torch.nn.Linear(hidden_size, hidden_size)
+        self.l2 = torch.nn.Linear(hidden_size, board_size[0] * board_size[1])
+    def forward(self, x):
+        x = self.conv(x).view(-1, self.hidden_size)
+        x = torch.nn.functional.relu(self.l1(x))
+        x = self.l2(x)
+        return x
 
 class Trainer:
     def __init__(self, game):
@@ -264,6 +329,24 @@ class Trainer:
         plt.xlabel('n_iter_train')
         plt.ylabel(f'Percentage off')
         plt.title('Зависимость исходов игры от числа итераций обучения')
+
+class ReplayMemory():
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = []
+        self.position = 0
+
+    def store(self, exptuple):
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        self.memory[self.position] = exptuple
+        self.position = (self.position + 1) % self.capacity
+       
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+    
+    def __len__(self):
+        return len(self.memory)
 
 # def check_rewards(self, player_x, player_o, n_iter=10000, use_tqdm=True):
 
