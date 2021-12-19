@@ -120,7 +120,7 @@ class ReplayMemory():
     def __len__(self):
         return len(self.memory)
 
-class QLearningPlayer:
+class QLearningPlayer(BasePlayer):
     def __init__(self, eps, alpha, gamma, n_rows=3, n_cols=3):
         self.size = (n_rows, n_cols)
         self.eps = eps
@@ -255,11 +255,29 @@ class DQNet(torch.nn.Module):
         x = torch.nn.functional.relu(self.l1(x))
         x = self.l2(x)
         return x
+    
+class DuelingDQNet(torch.nn.Module):
+    def __init__(self, hidden_size, board_size) -> None:
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.action_dim = board_size[0] * board_size[1]
+        self.conv = torch.nn.Conv2d(in_channels=1, out_channels=hidden_size, kernel_size=board_size)
+        self.l1 = torch.nn.Linear(hidden_size, hidden_size)
+        self.l2_v = torch.nn.Linear(hidden_size, 1)
+        self.l2_a = torch.nn.Linear(hidden_size, self.action_dim)
+    
+    def forward(self, x):
+        x = self.conv(x).view(-1, self.hidden_size)
+        x = torch.nn.functional.relu(self.l1(x))
+        v = self.l2_v(x)
+        a = self.l2_a(x)
+        return v + (a - a.mean())
 
 class Trainer:
     def __init__(self, game):
         self.game = game
         self.all_actions =  list(product(range(game.env.n_rows), range(game.env.n_cols)))
+        self.memory = None
 
     def train_table(self, training_side, player, sparring_partner=RandomPlayer(), n_iter=100000, use_tqdm=True):
         if not training_side in ('x', 'o'):
@@ -295,59 +313,83 @@ class Trainer:
         else:
             player_x = sparring_partner
             player_o = player
-        for i in tqdm(range(n_steps), desc='Collecting plot data', disable=(not use_tqdm)):                 
+        cur_wins_percentage = 0
+        pbar = tqdm(range(n_steps), disable=(not use_tqdm))
+        for i in pbar:
+            pbar.set_description(f'Wins percentage = {cur_wins_percentage}')                 
             self.train_table(training_side, player, sparring_partner, iter_step, use_tqdm=False)
             counts = self.game.check_rewards(player_x, player_o, n_iter=iter_check, use_tqdm=False)
             wins_sum = counts['wins_x'] if training_side == 'x' else counts['wins_o']
             loses_sum = counts['wins_o'] if training_side == 'x' else counts['wins_x']
             misses_sum = counts['missx'] if training_side == 'x' else counts['misso']
             wins_percentages.append(wins_sum / sum(counts.values()))
+            cur_wins_percentage = wins_percentages[-1]
             lose_percentages.append(loses_sum / sum(counts.values()))
             draws_percentages.append(counts['draws'] / sum(counts.values()))
             misses_percentages.append(misses_sum / sum(counts.values()))
             # print(f'Wins percentage: {wins_sum / sum(counts.values())}')
-            clear_output()
-            print(f'{int(i + 1)} / {int(n_steps)} finished')
-            x_plot = np.arange(iter_step, (i + 2) * iter_step, iter_step)
-            plt.figure(figsize=figsize)
-            sns.lineplot(x=x_plot, y=wins_percentages, alpha=0.7, marker='o', label='player wins')
-            sns.lineplot(x=x_plot, y=lose_percentages, alpha=0.7, marker='o', label='player loses')
-            sns.lineplot(x=x_plot, y=draws_percentages, alpha=0.7, marker='o', label='draws')
-            sns.lineplot(x=x_plot, y=misses_percentages, alpha=0.7, marker='o', label='player misses')
-            plt.xlabel('n_iter_train')
-            plt.ylabel(f'Percentage off')
-            plt.title('Зависимость исходов игры от числа итераций обучения')
-            plt.show()
-
-    def plot_learning_two(self, player_x, player_o, max_iter=500000, iter_step=10000, iter_check=100000,
-                          use_tqdm=True, figsize=(16, 9)):
-        n_steps = max_iter // iter_step
-        winsx_percentages = []
-        winso_percentages = []
-        draws_percentages = []
-        player_x.reset()
-        player_o.reset()
-        for i in tqdm(range(n_steps), desc='Collecting plot data', disable=(not use_tqdm)):                 
-            self.train_two(player_x, player_o, iter_step, use_tqdm=False)
-            counts = self.game.check_rewards(player_x, player_o, n_iter=iter_check, use_tqdm=False)
-            winsx_sum = counts['wins_x']
-            winso_sum = counts['wins_o']
-            winsx_percentages.append(winsx_sum / sum(counts.values()))
-            winso_percentages.append(winso_sum / sum(counts.values()))
-            draws_percentages.append(counts['draws'] / sum(counts.values()))
-            print(f'Winsx percentage: {winsx_sum / sum(counts.values())}')
+            # clear_output()
+            # print(f'{int(i + 1)} / {int(n_steps)} finished')
         x_plot = np.arange(iter_step, max_iter + iter_step, iter_step)
         plt.figure(figsize=figsize)
-        sns.lineplot(x=x_plot, y=winsx_percentages, alpha=0.7, marker='o', label='x wins')
-        sns.lineplot(x=x_plot, y=winso_percentages, alpha=0.7, marker='o', label='o wins')
+        sns.lineplot(x=x_plot, y=wins_percentages, alpha=0.7, marker='o', label='player wins')
+        sns.lineplot(x=x_plot, y=lose_percentages, alpha=0.7, marker='o', label='player loses')
         sns.lineplot(x=x_plot, y=draws_percentages, alpha=0.7, marker='o', label='draws')
+        sns.lineplot(x=x_plot, y=misses_percentages, alpha=0.7, marker='o', label='player misses')
         plt.xlabel('n_iter_train')
         plt.ylabel(f'Percentage off')
         plt.title('Зависимость исходов игры от числа итераций обучения')
+        plt.show()
+
+    def plot_learning_deep(self, training_side, player, sparring_partner=RandomPlayer(), max_epoch=1000, epoch_step=4, use_tqdm=True,
+                           memory_capacity=10000, batch_size=512, iter_check=10000, figsize=(16, 9)):
+        player.reset()
+        n_steps = max_epoch // epoch_step
+        wins_percentages = []
+        lose_percentages = []
+        draws_percentages = []
+        misses_percentages = []
+        losses = []
+        if training_side == 'x':
+            player_x = player
+            player_o = sparring_partner
+        else:
+            player_x = sparring_partner
+            player_o = player
+        cur_wins_percentage = 0
+        loss = 1000
+        pbar = tqdm(range(n_steps), disable=(not use_tqdm))
+        for i in pbar:
+            pbar.set_description(f'Loss={loss:.4f}, wp={cur_wins_percentage}')                 
+            loss = self.train_deep(training_side, player, sparring_partner, memory_capacity=memory_capacity, batch_size=batch_size, epochs=epoch_step, use_tqdm=False)
+            counts = self.game.check_rewards(player_x, player_o, n_iter=iter_check, use_tqdm=False)
+            wins_sum = counts['wins_x'] if training_side == 'x' else counts['wins_o']
+            loses_sum = counts['wins_o'] if training_side == 'x' else counts['wins_x']
+            misses_sum = counts['missx'] if training_side == 'x' else counts['misso']
+            wins_percentages.append(wins_sum / sum(counts.values()))
+            cur_wins_percentage = wins_percentages[-1]
+            lose_percentages.append(loses_sum / sum(counts.values()))
+            draws_percentages.append(counts['draws'] / sum(counts.values()))
+            misses_percentages.append(misses_sum / sum(counts.values()))
+            # print(f'Wins percentage: {wins_sum / sum(counts.values())}')
+            # clear_output()
+            # print(f'{int(i + 1)} / {int(n_steps)} finished')
+        x_plot = np.arange(epoch_step, max_epoch + epoch_step, epoch_step)
+        plt.figure(figsize=figsize)
+        sns.lineplot(x=x_plot, y=wins_percentages, alpha=0.7, marker='o', label='player wins')
+        sns.lineplot(x=x_plot, y=lose_percentages, alpha=0.7, marker='o', label='player loses')
+        sns.lineplot(x=x_plot, y=draws_percentages, alpha=0.7, marker='o', label='draws')
+        sns.lineplot(x=x_plot, y=misses_percentages, alpha=0.7, marker='o', label='player misses')
+        # sns.lineplot(x=x_plot, y=losses, alpha=0.7, marker='o', label='MSE-loss')
+        plt.xlabel('n_iter_train')
+        plt.ylabel(f'Percentage off')
+        plt.title('Зависимость исходов игры от числа итераций обучения')
+        self.memory = None
 
     def train_deep(self, training_side, player, sparring_parner=RandomPlayer(), memory_capacity=10000,
                    batch_size=512, epochs=20, use_tqdm=True):
-        memory = ReplayMemory(memory_capacity)
+        if self.memory is None:
+            self.memory = ReplayMemory(memory_capacity)
         terminal_state = '9' * self.game.env.n_rows * self.game.env.n_cols 
         loss = 1000
         pbar = tqdm(range(epochs), disable=not use_tqdm)
@@ -377,11 +419,12 @@ class Trainer:
                         state_next = terminal_state
                     exptuple_o = (state, action, reward, state_next)
                 if training_side == 'x':
-                    memory.store(exptuple=exptuple_x)
+                    self.memory.store(exptuple=exptuple_x)
                 else:
-                    memory.store(exptuple=exptuple_o)
-            states, actions, rewards, states_next = zip(*memory.sample(512))
+                    self.memory.store(exptuple=exptuple_o)
+            states, actions, rewards, states_next = zip(*self.memory.sample(batch_size))
             loss = player.update_q((states, actions, rewards, states_next))
+        return loss
     
     
     
@@ -431,3 +474,67 @@ if __name__ == "__main__":
         if (i + 1)  % 256 == 0:
             states, actions, rewards, states_next = zip(*memory_x.sample(8))
             loss = player_x.update_q((states, actions, rewards, states_next))
+            
+# def plot_learning_two(self, player_x, player_o, max_iter=500000, iter_step=10000, iter_check=100000,
+#                           use_tqdm=True, figsize=(16, 9)):
+#         n_steps = max_iter // iter_step
+#         winsx_percentages = []
+#         winso_percentages = []
+#         draws_percentages = []
+#         player_x.reset()
+#         player_o.reset()
+#         for i in tqdm(range(n_steps), desc='Collecting plot data', disable=(not use_tqdm)):                 
+#             self.train_two(player_x, player_o, iter_step, use_tqdm=False)
+#             counts = self.game.check_rewards(player_x, player_o, n_iter=iter_check, use_tqdm=False)
+#             winsx_sum = counts['wins_x']
+#             winso_sum = counts['wins_o']
+#             winsx_percentages.append(winsx_sum / sum(counts.values()))
+#             winso_percentages.append(winso_sum / sum(counts.values()))
+#             draws_percentages.append(counts['draws'] / sum(counts.values()))
+#             print(f'Winsx percentage: {winsx_sum / sum(counts.values())}')
+#         x_plot = np.arange(iter_step, max_iter + iter_step, iter_step)
+#         plt.figure(figsize=figsize)
+#         sns.lineplot(x=x_plot, y=winsx_percentages, alpha=0.7, marker='o', label='x wins')
+#         sns.lineplot(x=x_plot, y=winso_percentages, alpha=0.7, marker='o', label='o wins')
+#         sns.lineplot(x=x_plot, y=draws_percentages, alpha=0.7, marker='o', label='draws')
+#         plt.xlabel('n_iter_train')
+#         plt.ylabel(f'Percentage off')
+#         plt.title('Зависимость исходов игры от числа итераций обучения')
+
+#     def train_deep(self, training_side, player, sparring_parner=RandomPlayer(), memory_capacity=10000,
+#                    batch_size=512, epochs=20, use_tqdm=True):
+#         memory = ReplayMemory(memory_capacity)
+#         terminal_state = '9' * self.game.env.n_rows * self.game.env.n_cols 
+#         loss = 1000
+#         pbar = tqdm(range(epochs), disable=not use_tqdm)
+#         if training_side == 'x':
+#             player_x = player
+#             player_o = sparring_parner
+#         else:
+#             player_o = player
+#             player_x = sparring_parner
+#         for i in pbar:
+#             pbar.set_description(f'loss={loss: .4f}')
+#             for j in range(batch_size):
+#                 states, actions, rewards = self.game.run_episode(player_x, player_o, return_history=True)
+#                 (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = states, actions, rewards
+#                 for t in range(len(states_x)):
+#                     state, action, reward = states_x[t][0], self.all_actions.index(actions_x[t]), rewards_x[t]
+#                     if t < len(states_x) - 1:
+#                         state_next = states_x[t + 1][0]
+#                     else:
+#                         state_next = terminal_state
+#                     exptuple_x = (state, action, reward, state_next)
+#                 for t in range(len(states_o)):
+#                     state, action, reward = states_o[t][0], self.all_actions.index(actions_o[t]), rewards_o[t]
+#                     if t < len(states_o) - 1:
+#                         state_next = states_o[t + 1][0]
+#                     else:
+#                         state_next = terminal_state
+#                     exptuple_o = (state, action, reward, state_next)
+#                 if training_side == 'x':
+#                     memory.store(exptuple=exptuple_x)
+#                 else:
+#                     memory.store(exptuple=exptuple_o)
+#             states, actions, rewards, states_next = zip(*memory.sample(512))
+#             loss = player.update_q((states, actions, rewards, states_next))
