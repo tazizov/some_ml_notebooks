@@ -11,6 +11,8 @@ import seaborn as sns
 from IPython.display import clear_output
 import random
 
+TERMINAL_STATE = 0
+
 class BasePlayer(ABC):
     def set_training(self):
         self.training = True
@@ -30,7 +32,7 @@ class BasePlayer(ABC):
 class RandomPlayer(BasePlayer):
     def strategy(self, state):
         possible_steps = state[1]
-        return possible_steps[np.random.randint(possible_steps.shape[0])]
+        return tuple(possible_steps[np.random.randint(possible_steps.shape[0])].tolist())
     
     def reset(self):
         pass
@@ -99,7 +101,24 @@ class TicTacToeGame:
             'missx': miss_x,
             'misso': miss_o
         }
+        
+class ReplayMemory():
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.memory = []
+        self.position = 0
 
+    def store(self, exptuple):
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+        self.memory[self.position] = exptuple
+        self.position = (self.position + 1) % self.capacity
+       
+    def sample(self, batch_size):
+        return random.sample(self.memory, batch_size)
+    
+    def __len__(self):
+        return len(self.memory)
 
 class QLearningPlayer:
     def __init__(self, eps, alpha, gamma, n_rows=3, n_cols=3):
@@ -171,6 +190,7 @@ class DQNPlayer(BasePlayer):
         self.all_actions = list(product(range(n_rows), range(n_cols)))
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=alpha)
         self.training = True
+        self.terminal_state = '9' * (n_rows * n_cols)
         
     def strategy(self, state):
         state_hash = state[0]
@@ -195,14 +215,16 @@ class DQNPlayer(BasePlayer):
 
     def update_q(self, experience):
         states, actions, rewards, states_next = experience
-        states = torch.cat([self._state_to_tensor(state) for state in states])
-        states_next = torch.cat([self._state_to_tensor(state) for state in states_next])
-        actions = torch.tensor(actions, dtype=torch.int64).unsqueeze(1)
-        rewards = torch.tensor(rewards, dtype=torch.float64)
-        q = self.model(states).gather(1, actions)
-        qmax = self.model(states_next).detach().max(1)[0]
-        qnext = rewards + (self.gamma * qmax)
-        loss = torch.nn.functional.mse_loss(q.flatten().float(), qnext.flatten().float())
+        states_tensor = torch.cat([self._state_to_tensor(state) for state in states])
+        states_next_tensor = torch.cat([self._state_to_tensor(state) for state in states_next])
+        actions_tensor = torch.tensor(actions, dtype=torch.int64).unsqueeze(1)
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float64).unsqueeze(1)
+        q = self.model(states_tensor).gather(1, actions_tensor)
+        qmax = self.model(states_next_tensor).detach().max(1)[0].unsqueeze(1)
+        terminal_inds = np.where(np.array(states_next) == self.terminal_state)[0]
+        qmax = qmax.index_fill(0, torch.tensor(terminal_inds), 0)
+        qnext = rewards_tensor + (self.gamma * qmax)
+        loss = torch.nn.functional.mse_loss(q.float(), qnext.float())
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -210,6 +232,12 @@ class DQNPlayer(BasePlayer):
         
     def _state_to_tensor(self, state_hash):
         return torch.tensor(np.array(list(state_hash), dtype=np.float64)).reshape(1, 1, self.size[0], self.size[1]).float()
+    
+    def save(self, path):
+        torch.save(self.model, path)
+    
+    def load(self, path):
+        self.model = torch.load(path)
     
     def reset(self):
         pass
@@ -231,11 +259,11 @@ class DQNet(torch.nn.Module):
 class Trainer:
     def __init__(self, game):
         self.game = game
+        self.all_actions =  list(product(range(game.env.n_rows), range(game.env.n_cols)))
 
-    def train_one(self, training_side, player, sparring_partner=RandomPlayer(), n_iter=100000, use_tqdm=True):
+    def train_table(self, training_side, player, sparring_partner=RandomPlayer(), n_iter=100000, use_tqdm=True):
         if not training_side in ('x', 'o'):
             raise ValueError('training_side must be "x" or "o"')
-        player.set_training()
         sparring_partner.set_evaluating()
         if training_side == 'x':
             player_x = player
@@ -253,19 +281,7 @@ class Trainer:
             else:
                 player_o.update_q(history_o)
 
-    def train_two(self, player_x, player_o, n_iter, use_tqdm=True):
-        player_x.set_training()
-        player_o.set_training()
-        desc = f'Training x: {player_x.__str__()} vs o: {player_o.__str__()}'
-        for i in tqdm(range(n_iter), desc=desc, disable=(not use_tqdm)):
-            states, actions, rewards = self.game.run_episode(player_x, player_o, return_history=True)
-            (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = states, actions, rewards
-            history_x = (states_x, actions_x, rewards_x)
-            history_o = (states_o, actions_o, rewards_o)
-            player_x.update_q(history_x)
-            player_o.update_q(history_o)
-
-    def plot_learning_one(self, training_side, player, sparring_partner=RandomPlayer(),
+    def plot_learning_table(self, training_side, player, sparring_partner=RandomPlayer(),
                          max_iter=500000, iter_step=10000, iter_check=100000, use_tqdm=True, figsize=(16, 9)):
         player.reset()
         n_steps = max_iter // iter_step
@@ -280,7 +296,7 @@ class Trainer:
             player_x = sparring_partner
             player_o = player
         for i in tqdm(range(n_steps), desc='Collecting plot data', disable=(not use_tqdm)):                 
-            self.train_one(training_side, player, sparring_partner, iter_step, use_tqdm=False)
+            self.train_table(training_side, player, sparring_partner, iter_step, use_tqdm=False)
             counts = self.game.check_rewards(player_x, player_o, n_iter=iter_check, use_tqdm=False)
             wins_sum = counts['wins_x'] if training_side == 'x' else counts['wins_o']
             loses_sum = counts['wins_o'] if training_side == 'x' else counts['wins_x']
@@ -302,7 +318,6 @@ class Trainer:
             plt.ylabel(f'Percentage off')
             plt.title('Зависимость исходов игры от числа итераций обучения')
             plt.show()
-
 
     def plot_learning_two(self, player_x, player_o, max_iter=500000, iter_step=10000, iter_check=100000,
                           use_tqdm=True, figsize=(16, 9)):
@@ -330,23 +345,47 @@ class Trainer:
         plt.ylabel(f'Percentage off')
         plt.title('Зависимость исходов игры от числа итераций обучения')
 
-class ReplayMemory():
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
-
-    def store(self, exptuple):
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = exptuple
-        self.position = (self.position + 1) % self.capacity
-       
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+    def train_deep(self, training_side, player, sparring_parner=RandomPlayer(), memory_capacity=10000,
+                   batch_size=512, epochs=20, use_tqdm=True):
+        memory = ReplayMemory(memory_capacity)
+        terminal_state = '9' * self.game.env.n_rows * self.game.env.n_cols 
+        loss = 1000
+        pbar = tqdm(range(epochs), disable=not use_tqdm)
+        if training_side == 'x':
+            player_x = player
+            player_o = sparring_parner
+        else:
+            player_o = player
+            player_x = sparring_parner
+        for i in pbar:
+            pbar.set_description(f'loss={loss: .4f}')
+            for j in range(batch_size):
+                states, actions, rewards = self.game.run_episode(player_x, player_o, return_history=True)
+                (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = states, actions, rewards
+                for t in range(len(states_x)):
+                    state, action, reward = states_x[t][0], self.all_actions.index(actions_x[t]), rewards_x[t]
+                    if t < len(states_x) - 1:
+                        state_next = states_x[t + 1][0]
+                    else:
+                        state_next = terminal_state
+                    exptuple_x = (state, action, reward, state_next)
+                for t in range(len(states_o)):
+                    state, action, reward = states_o[t][0], self.all_actions.index(actions_o[t]), rewards_o[t]
+                    if t < len(states_o) - 1:
+                        state_next = states_o[t + 1][0]
+                    else:
+                        state_next = terminal_state
+                    exptuple_o = (state, action, reward, state_next)
+                if training_side == 'x':
+                    memory.store(exptuple=exptuple_x)
+                else:
+                    memory.store(exptuple=exptuple_o)
+            states, actions, rewards, states_next = zip(*memory.sample(512))
+            loss = player.update_q((states, actions, rewards, states_next))
     
-    def __len__(self):
-        return len(self.memory)
+    
+    
+
 
 # def check_rewards(self, player_x, player_o, n_iter=10000, use_tqdm=True):
 
@@ -354,13 +393,41 @@ class ReplayMemory():
 if __name__ == "__main__":
     env = TicTacToe()
     game = TicTacToeGame(env)
-    qplayer_params = {'eps': 0.1, 'alpha': 0.01, 'gamma': 1}
-    qplayer_x , qplayer_o = QLearningPlayer(**qplayer_params), QLearningPlayer(**qplayer_params)
-    for i in tqdm(range(10)):
-        (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = game.run_episode(qplayer_x, qplayer_o, True)
-        history_x = (states_x, actions_x, rewards_x)
-        history_o = (states_o, actions_o, rewards_o)
-        qplayer_x.update_q(history_x)
-        qplayer_o.update_q(history_o)
-    (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = game.run_episode(qplayer_x, qplayer_o, True)
-    qplayer_x.update_q(history_x)
+    # qplayer_params = {'eps': 0.1, 'alpha': 0.01, 'gamma': 1}
+    # qplayer_x , qplayer_o = QLearningPlayer(**qplayer_params), QLearningPlayer(**qplayer_params)
+    # for i in tqdm(range(10)):
+    #     (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = game.run_episode(qplayer_x, qplayer_o, True)
+    #     history_x = (states_x, actions_x, rewards_x)
+    #     history_o = (states_o, actions_o, rewards_o)
+    #     qplayer_x.update_q(history_x)
+    #     qplayer_o.update_q(history_o)
+    # (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = game.run_episode(qplayer_x, qplayer_o, True)
+    # qplayer_x.update_q(history_x)
+    memory_x, memory_o = ReplayMemory(10000), ReplayMemory(10000)
+    player_x = DQNPlayer(0.2, 3e-4, 0.7, 3, 3)
+    player_o = RandomPlayer()
+    loss = 1000
+    pbar = tqdm(range(1000000))
+    for i in pbar:
+        pbar.set_description(f'loss={loss: .4f}')
+        states, actions, rewards = game.run_episode(player_x, player_o, return_history=True)
+        (states_x, states_o), (actions_x, actions_o), (rewards_x, rewards_o) = states, actions, rewards
+        for t in range(len(states_x)):
+            state, action, reward = states_x[t][0], player_x.all_actions.index(tuple(actions_x[t])), rewards_x[t]
+            if t < len(states_x) - 1:
+                state_next = states_x[t + 1][0]
+            else:
+                state_next = '999999999'
+            exptuple_x = (state, action, reward, state_next)
+            memory_x.store(exptuple=exptuple_x)
+        for t in range(len(states_o)):
+            state, action, reward = states_o[t][0], player_x.all_actions.index(tuple(actions_o[t].tolist())), rewards_o[t]
+            if t < len(states_o) - 1:
+                state_next = states_o[t + 1][0]
+            else:
+                state_next = '999999999'
+            exptuple_o = (state, action, reward, state_next)
+            memory_o.store(exptuple=exptuple_o)
+        if (i + 1)  % 256 == 0:
+            states, actions, rewards, states_next = zip(*memory_x.sample(8))
+            loss = player_x.update_q((states, actions, rewards, states_next))
